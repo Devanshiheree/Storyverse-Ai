@@ -7,3 +7,15 @@ server/node_modules/
 server/dist/
 server/.env
 .DS_Store
+.env
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Firebase debug logs
+firebase-debug.log
+
+# TypeScript build cache
+*.tsbuildinfo
