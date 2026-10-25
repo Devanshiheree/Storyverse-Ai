@@ -1,9 +1,3 @@
-// ============================================================
-// APP CONTEXT — Global story data backed by Cloud Firestore
-// Each user's data is stored under: users/{uid}/projects
-//                                   users/{uid}/characters
-// Data is private — only the authenticated user can access it.
-// ============================================================
 
 import React, {
   createContext,
@@ -13,19 +7,6 @@ import React, {
   useEffect,
 } from 'react';
 
-import {
-  collection,
-  doc,
-  onSnapshot,
-  setDoc,
-  deleteDoc,
-  serverTimestamp,
-  Timestamp,
-} from 'firebase/firestore';
-
-import { db } from '../firebase';
-import { useAuth } from './AuthContext';
-
 import type {
   StoryProject,
   Character,
@@ -34,26 +15,40 @@ import type {
   AppView,
 } from '../types';
 
-import { DEMO_SCENE, DEMO_FORK } from '../data/sampleData';
+import {
+  SAMPLE_PROJECTS,
+  DEMO_CHARACTERS,
+  DEMO_SCENE,
+  DEMO_FORK,
+} from '../data/sampleData';
 
-// ——— Helpers ————————————————————————————————————————————————
+// Storage keys
+const PROJECTS_KEY = 'storyverse_projects';
+const CHARACTERS_KEY = 'storyverse_characters';
 
-const genId = () => Math.random().toString(36).slice(2, 10);
+// Read saved data safely from localStorage
+function loadFromStorage<T>(key: string, fallback: T): T {
+  try {
+    const saved = localStorage.getItem(key);
 
-/** Convert Firestore Timestamp or string → Date */
-function toDate(value: unknown): Date {
-  if (value instanceof Timestamp) return value.toDate();
-  if (value instanceof Date) return value;
-  if (typeof value === 'string') return new Date(value);
-  return new Date();
+    if (saved !== null) {
+      return JSON.parse(saved) as T;
+    }
+  } catch (error) {
+    console.error(`Could not load ${key}:`, error);
+  }
+
+  return fallback;
 }
 
-/** Strip undefined fields so Firestore doesn't complain */
-function clean<T extends object>(obj: T): T {
-  return JSON.parse(JSON.stringify(obj)) as T;
+// Convert stored date strings back into Date objects
+function restoreProjectDates(projects: StoryProject[]): StoryProject[] {
+  return projects.map((project) => ({
+    ...project,
+    createdAt: new Date(project.createdAt),
+    updatedAt: new Date(project.updatedAt),
+  }));
 }
-
-// ——— Context type ————————————————————————————————————————————
 
 interface AppContextType {
   currentView: AppView;
@@ -66,7 +61,10 @@ interface AppContextType {
   activeProject: StoryProject | null;
 
   createProject: (
-    project: Omit<StoryProject, 'id' | 'createdAt' | 'updatedAt' | 'wordCount'>
+    project: Omit<
+      StoryProject,
+      'id' | 'createdAt' | 'updatedAt' | 'wordCount'
+    >
   ) => void;
 
   updateProject: (id: string, updates: Partial<StoryProject>) => void;
@@ -87,168 +85,159 @@ interface AppContextType {
 
 const AppContext = createContext<AppContextType | null>(null);
 
-// ——— Provider ————————————————————————————————————————————————
+const genId = () => Math.random().toString(36).slice(2, 10);
 
-export function AppProvider({ children }: { children: React.ReactNode }) {
-  const { user } = useAuth();
+export function AppProvider({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const [currentView, setCurrentView] =
+    useState<AppView>('dashboard');
 
-  const [currentView, setCurrentView]           = useState<AppView>('dashboard');
-  const [activeProjectId, setActiveProjectId]   = useState<string | null>(null);
-  const [activeCharacterId, setActiveCharacterId] = useState<string | null>(null);
-  const [projects, setProjects]                 = useState<StoryProject[]>([]);
-  const [characters, setCharacters]             = useState<Character[]>([]);
+  const [activeProjectId, setActiveProjectId] =
+    useState<string | null>(null);
 
-  // Static demo data (scene simulator and forks are still local)
-  const [scenes]  = useState<Scene[]>([DEMO_SCENE]);
-  const [forks]   = useState<StoryFork[]>([DEMO_FORK]);
+  const [activeCharacterId, setActiveCharacterId] =
+    useState<string | null>(null);
 
-  // ——— Real-time Firestore listeners ————————————————————————
+  // Load saved projects and characters when the app starts
+  const [projects, setProjects] = useState<StoryProject[]>(() =>
+    restoreProjectDates(
+      loadFromStorage<StoryProject[]>(
+        PROJECTS_KEY,
+        SAMPLE_PROJECTS
+      )
+    )
+  );
+
+  const [characters, setCharacters] = useState<Character[]>(() =>
+    loadFromStorage<Character[]>(
+      CHARACTERS_KEY,
+      DEMO_CHARACTERS
+    )
+  );
+
+  const [scenes] = useState<Scene[]>([DEMO_SCENE]);
+  const [forks] = useState<StoryFork[]>([DEMO_FORK]);
+
+  // Save projects and characters whenever they change
+  useEffect(() => {
+    try {
+      localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
+    } catch (error) {
+      console.error('Could not save StoryVerse projects:', error);
+    }
+  }, [projects]);
 
   useEffect(() => {
-    if (!user) {
-      // Clear data when signed out
-      setProjects([]);
-      setCharacters([]);
-      setActiveProjectId(null);
-      setCurrentView('dashboard');
-      return;
+    try {
+      localStorage.setItem(CHARACTERS_KEY, JSON.stringify(characters));
+    } catch (error) {
+      console.error('Could not save StoryVerse characters:', error);
     }
-
-    // Subscribe to this user's projects
-    const projectsRef = collection(db, 'users', user.uid, 'projects');
-    const unsubProjects = onSnapshot(projectsRef, (snapshot) => {
-      const loaded: StoryProject[] = snapshot.docs.map((d) => {
-        const data = d.data();
-        return {
-          id:          d.id,
-          title:       data.title ?? 'Untitled',
-          genre:       data.genre ?? 'Fiction',
-          plotSummary: data.plotSummary ?? '',
-          manuscript:  data.manuscript ?? '',
-          coverColor:  data.coverColor ?? 'from-indigo-900 via-violet-900 to-slate-900',
-          wordCount:   data.wordCount ?? 0,
-          status:      data.status ?? 'draft',
-          createdAt:   toDate(data.createdAt),
-          updatedAt:   toDate(data.updatedAt),
-        } as StoryProject;
-      });
-
-      // Sort by most recently updated
-      loaded.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
-      setProjects(loaded);
-    });
-
-    // Subscribe to this user's characters
-    const charsRef = collection(db, 'users', user.uid, 'characters');
-    const unsubChars = onSnapshot(charsRef, (snapshot) => {
-      const loaded: Character[] = snapshot.docs.map((d) => ({
-        id: d.id,
-        ...d.data(),
-      })) as Character[];
-      setCharacters(loaded);
-    });
-
-    return () => {
-      unsubProjects();
-      unsubChars();
-    };
-  }, [user]);
-
-  // ——— Derived values ——————————————————————————————————————
+  }, [characters]);
 
   const activeProject =
-    projects.find((p) => p.id === activeProjectId) ?? null;
+    projects.find((project) => project.id === activeProjectId) ?? null;
 
   const activeScene =
-    scenes.find((s) => s.storyId === activeProjectId) ?? null;
+    scenes.find((scene) => scene.storyId === activeProjectId) ?? null;
 
-  // ——— Project mutations ———————————————————————————————————
-
+  // Create a new story
   const createProject = useCallback(
-    (project: Omit<StoryProject, 'id' | 'createdAt' | 'updatedAt' | 'wordCount'>) => {
-      if (!user) return;
+    (
+      project: Omit<
+        StoryProject,
+        'id' | 'createdAt' | 'updatedAt' | 'wordCount'
+      >
+    ) => {
+      const now = new Date();
 
-      const id  = genId();
-      const now = serverTimestamp();
-      const wordCount = project.manuscript
-        ? project.manuscript.trim().split(/\s+/).filter(Boolean).length
-        : 0;
-
-      const docRef = doc(db, 'users', user.uid, 'projects', id);
-      setDoc(docRef, clean({
+      const newProject: StoryProject = {
         ...project,
-        wordCount,
+        id: genId(),
         createdAt: now,
         updatedAt: now,
-      })).catch(console.error);
+        wordCount: project.manuscript
+          ? project.manuscript.trim().split(/\s+/).filter(Boolean).length
+          : 0,
+      };
 
-      setActiveProjectId(id);
+      setProjects((previous) => [newProject, ...previous]);
+      setActiveProjectId(newProject.id);
       setCurrentView('editor');
     },
-    [user]
+    []
   );
 
+  // Update a story and save its latest version
   const updateProject = useCallback(
     (id: string, updates: Partial<StoryProject>) => {
-      if (!user) return;
+      setProjects((previous) =>
+        previous.map((project) => {
+          if (project.id !== id) return project;
 
-      const extra: Partial<{ wordCount: number }> = {};
-      if (updates.manuscript !== undefined) {
-        extra.wordCount = updates.manuscript
-          .trim()
-          .split(/\s+/)
-          .filter(Boolean).length;
-      }
+          const updatedProject = {
+            ...project,
+            ...updates,
+            updatedAt: new Date(),
+          };
 
-      const docRef = doc(db, 'users', user.uid, 'projects', id);
-      setDoc(
-        docRef,
-        clean({ ...updates, ...extra, updatedAt: serverTimestamp() }),
-        { merge: true }
-      ).catch(console.error);
+          if (updates.manuscript !== undefined) {
+            updatedProject.wordCount = updates.manuscript
+              .trim()
+              .split(/\s+/)
+              .filter(Boolean).length;
+          }
+
+          return updatedProject;
+        })
+      );
     },
-    [user]
+    []
   );
 
-  const deleteProject = useCallback(
-    (id: string) => {
-      if (!user) return;
+  // Delete a story from state and browser storage
+  const deleteProject = useCallback((id: string) => {
+    setProjects((previous) =>
+      previous.filter((project) => project.id !== id)
+    );
 
-      const docRef = doc(db, 'users', user.uid, 'projects', id);
-      deleteDoc(docRef).catch(console.error);
+    setActiveProjectId((currentId) =>
+      currentId === id ? null : currentId
+    );
 
-      setActiveProjectId((curr) => (curr === id ? null : curr));
-      setCurrentView('dashboard');
-    },
-    [user]
-  );
+    setCurrentView('dashboard');
+  }, []);
 
-  // ——— Character mutations ————————————————————————————————
-
+  // Create a character
   const createCharacter = useCallback(
     (character: Omit<Character, 'id'>) => {
-      if (!user) return;
+      const newCharacter: Character = {
+        ...character,
+        id: genId(),
+      };
 
-      const id = genId();
-      const docRef = doc(db, 'users', user.uid, 'characters', id);
-      setDoc(docRef, clean(character)).catch(console.error);
-
-      setActiveCharacterId(id);
+      setCharacters((previous) => [...previous, newCharacter]);
+      setActiveCharacterId(newCharacter.id);
     },
-    [user]
+    []
   );
 
+  // Update a character
   const updateCharacter = useCallback(
     (id: string, updates: Partial<Character>) => {
-      if (!user) return;
-
-      const docRef = doc(db, 'users', user.uid, 'characters', id);
-      setDoc(docRef, clean(updates), { merge: true }).catch(console.error);
+      setCharacters((previous) =>
+        previous.map((character) =>
+          character.id === id
+            ? { ...character, ...updates }
+            : character
+        )
+      );
     },
-    [user]
+    []
   );
-
-  // ——— Render ——————————————————————————————————————————————
 
   return (
     <AppContext.Provider
@@ -279,8 +268,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
 export function useApp() {
   const context = useContext(AppContext);
+
   if (!context) {
     throw new Error('useApp must be used inside <AppProvider>');
   }
+
   return context;
 }
